@@ -4,8 +4,14 @@ pub mod modes;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Mode {
-    Inputs,
+    CheckInputs,
     Debug,
+}
+
+#[derive(Debug)]
+pub struct RunOpts {
+    pub debug: bool,
+    pub sample_time: u8,
 }
   
 fn main() {
@@ -27,15 +33,37 @@ fn run() -> Result<(), Box<dyn Error>> {
                                         Arg::new("mode")
                                             .short('m')
                                             .help("Choose a mode")
-                                            .required(true)
+                                            .required(false)
                                             .value_parser(builder::EnumValueParser::<Mode>::new())
+                                    )
+                                    .arg(
+                                        Arg::new("sample")
+                                            .short('s')
+                                            .help("Sample time in seconds")
+                                            .required(false)
+                                            .value_parser(clap::value_parser!(u8).range(5..=30))
+                                            .default_value("5")
                                     );
+    
     let matches = cmd.get_matches();
-    let mode = matches.get_one::<Mode>("mode").unwrap();
+    let sample_time: u8 = *matches.get_one::<u8>("sample").unwrap();
+    
+    match matches.get_one::<Mode>("mode") {
+           Some(mode) => match &mode {
+                            Mode::CheckInputs => crate::modes::check_inputs_mode()?,
+                            Mode::Debug => crate::modes::main_mode(RunOpts 
+                                                            {
+                                                                debug: true,
+                                                                sample_time,
+                                                            })?,
+                                    },
+           None => crate::modes::main_mode(RunOpts
+               {
+                   debug: false,
+                   sample_time,
+               })?,
+    };
 
-    match mode {
-        Mode::Inputs => crate::modes::check_input_devices(),
-        Mode::Debug => println!("Running in debug mode."),
-    }
     Ok(())
 }
+
