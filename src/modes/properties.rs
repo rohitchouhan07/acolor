@@ -1,5 +1,4 @@
-pub fn print_amplitude(samples: &Vec<f32>) {
-
+pub fn print_amplitude_loudness(samples: &Vec<f32>) {
     // RMS (root mean square) gives you overall loudness
     let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
 

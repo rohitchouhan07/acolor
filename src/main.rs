@@ -1,6 +1,7 @@
 use clap::{Arg, Command, builder, ValueEnum};
 use std::{error::Error, process};
 pub mod modes;
+pub mod colors;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Mode {
