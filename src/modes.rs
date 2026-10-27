@@ -62,6 +62,8 @@ pub fn main_mode(opts: RunOpts) -> Result<(), Box<dyn Error>> {
     for (r, g, b) in &palette {
         println!("  rgb({}, {}, {})", r, g, b);
     }
+    colors::save_palette_card(&palette, "palette.png")?;
+    println!("Saved palette.png");
   
     if opts.debug == true {
         properties::print_amplitude_loudness(&samples);

@@ -1,6 +1,8 @@
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::f32::consts::PI;
 use std::num::NonZero;
+use image::{Rgba, RgbaImage};
+use std::error::Error;
 
 use crate::RunOpts;
 
@@ -21,6 +23,54 @@ const BANDS: [Band; 3] = [
 struct BandStats {
     peak_freq: f32,  // strongest frequency inside the band
     avg_power: f32,  // mean power per bin, so wide bands aren't favored
+}
+
+fn lerp(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+/// 0.0 outside the rounded corners, 1.0 inside, with a 1px antialiased edge.
+fn corner_alpha(x: u32, y: u32, w: u32, h: u32, r: f32) -> f32 {
+    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+    let cx = if px < r { r } else if px > w as f32 - r { w as f32 - r } else { return 1.0 };
+    let cy = if py < r { r } else if py > h as f32 - r { h as f32 - r } else { return 1.0 };
+    let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+    (r - dist + 0.5).clamp(0.0, 1.0)
+}
+
+pub fn save_palette_card(palette: &[(u8, u8, u8)], path: &str) -> Result<(), Box<dyn Error>> {
+    const W: u32 = 1200;
+    const H: u32 = 630;
+    const SWATCH_H: u32 = 140; // height of the solid swatch strip at the bottom
+    const RADIUS: f32 = 32.0;
+
+    let n = palette.len();
+    if n == 0 {
+        return Err("palette is empty".into());
+    }
+
+    let img = RgbaImage::from_fn(W, H, |x, y| {
+        let (r, g, b) = if y >= H - SWATCH_H {
+            // Bottom strip: one solid block per color
+            palette[(x as usize * n / W as usize).min(n - 1)]
+        } else if n == 1 {
+            palette[0]
+        } else {
+            // Gradient: find which two colors this x sits between
+            let t = x as f32 / (W - 1) as f32 * (n - 1) as f32;
+            let i = (t.floor() as usize).min(n - 2);
+            let f = t - i as f32;
+            let f = f * f * (3.0 - 2.0 * f); // smoothstep for softer transitions
+            let (c0, c1) = (palette[i], palette[i + 1]);
+            (lerp(c0.0, c1.0, f), lerp(c0.1, c1.1, f), lerp(c0.2, c1.2, f))
+        };
+
+        let alpha = (corner_alpha(x, y, W, H, RADIUS) * 255.0) as u8;
+        Rgba([r, g, b, alpha])
+    });
+
+    img.save(path)?;
+    Ok(())
 }
 
 /// Converts HSL (h: 0-360, s: 0-1, l: 0-1) to RGB (0-255 each)
