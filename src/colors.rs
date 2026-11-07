@@ -6,7 +6,7 @@ use std::error::Error;
 
 use crate::RunOpts;
 
-// hsl_to_rgb and freq_to_hue unchanged...
+type Rgb = (u8, u8, u8);
 
 struct Band {
     name: &'static str,
@@ -22,7 +22,48 @@ const BANDS: [Band; 3] = [
 
 struct BandStats {
     peak_freq: f32,  // strongest frequency inside the band
+    pitch_class: usize, // dominant note in the band (0 = C ... 11 = B)
     avg_power: f32,  // mean power per bin, so wide bands aren't favored
+    flatness: f32,   // 0 = pure tone, ~0.56 = white noise (see spectral_flatness)
+}
+
+/// Spectral flatness of a band: geometric mean / arithmetic mean of power.
+/// A pure tone puts all its power in a few bins -> close to 0.
+/// Noise spreads it evenly -> high. For a single FFT of white noise the
+/// expected value is about e^-0.5772 = 0.56, so that's our "fully noisy" point.
+fn spectral_flatness(power: &[f32]) -> f32 {
+    const EPS: f32 = 1e-12; // keeps ln() away from zero for silent bins
+    let n = power.len() as f32;
+    let arith = power.iter().sum::<f32>() / n;
+    if arith <= EPS {
+        return 1.0; // silence: treat as featureless noise
+    }
+    let geo = (power.iter().map(|p| (p + EPS).ln()).sum::<f32>() / n).exp();
+    geo / arith
+}
+
+const NOISE_FLATNESS: f32 = 0.56;
+/// Below this loudness level (0.1 = -55 dBFS) we refuse to make a palette.
+/// Typical mic self-noise in a quiet room sits around -60 to -70 dBFS.
+const MIN_LEVEL: f32 = 0.1;
+
+/// Maps flatness to saturation: tonal bands are vivid, noisy bands go grey.
+fn saturation_from_flatness(flatness: f32) -> f32 {
+    let tonality = 1.0 - (flatness / NOISE_FLATNESS).clamp(0.0, 1.0);
+    0.15 + 0.8 * tonality
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Maps RMS to a 0-1 loudness level on a dB scale.
+/// -60 dBFS (near silence) -> 0.0, -10 dBFS (very loud) -> 1.0.
+fn level_from_rms(rms: f32) -> f32 {
+    const FLOOR_DB: f32 = -60.0;
+    const CEIL_DB: f32 = -10.0;
+    let db = 20.0 * rms.max(1e-9).log10();
+    ((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB)).clamp(0.0, 1.0)
 }
 
 fn lerp(a: u8, b: u8, t: f32) -> u8 {
@@ -95,14 +136,24 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     )
 }
 
-/// Maps a frequency (Hz) to a hue (0-360 degrees).
-/// Uses a log scale since human pitch perception is logarithmic, not linear.
-fn freq_to_hue(freq: f32) -> f32 {
-    let min_freq = 20.0_f32;
-    let max_freq = 8000.0_f32; // most musically relevant content lives under here
-    let clamped = freq.clamp(min_freq, max_freq);
-    let log_pos = (clamped.ln() - min_freq.ln()) / (max_freq.ln() - min_freq.ln());
-    log_pos * 360.0
+const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
+
+/// Maps a frequency (Hz) to its pitch class: 0 = C, 1 = C#, ... 11 = B.
+/// Octave doesn't matter, so 110 Hz, 220 Hz and 440 Hz are all A (9).
+fn freq_to_pitch_class(freq: f32) -> usize {
+    // MIDI note number: A4 = 440 Hz = 69, one step per semitone
+    let midi = 69.0 + 12.0 * (freq / 440.0).log2();
+    (midi.round() as i32).rem_euclid(12) as usize
+}
+
+/// Maps a pitch class to a hue by walking the circle of fifths
+/// (C, G, D, A, E, ...). Notes that sound good together sit next to
+/// each other on the circle, so harmonious audio gives harmonious colors.
+fn pitch_class_to_hue(pc: usize) -> f32 {
+    let fifths_pos = (pc * 7) % 12; // 7 semitones = a perfect fifth
+    fifths_pos as f32 * 30.0
 }
 
 /// One FFT over the whole recording. Returns the magnitude of each bin
@@ -150,24 +201,56 @@ fn analyze_band(
         .enumerate()
         .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
 
-    let avg_power = slice.iter().map(|m| m * m).sum::<f32>() / slice.len() as f32;
+    let power: Vec<f32> = slice.iter().map(|m| m * m).collect();
+    let avg_power = power.iter().sum::<f32>() / power.len() as f32;
+    let flatness = spectral_flatness(&power);
+
+    // Chroma: fold every bin's power into one of 12 pitch classes, then pick
+    // the strongest. More robust than the single peak bin, since a note's
+    // energy is spread over neighbouring bins and its octaves.
+    let mut chroma = [0.0_f32; 12];
+    for (i, m) in slice.iter().enumerate() {
+        let freq = (start + i) as f32 * hz_per_bin;
+        chroma[freq_to_pitch_class(freq)] += m * m;
+    }
+    let (pitch_class, _) = chroma
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
 
     Some(BandStats {
         peak_freq: (start + peak_offset) as f32 * hz_per_bin,
+        pitch_class,
         avg_power,
+        flatness,
     })
 }
 
-/// Generates up to three colors (low, mid, high) from the recording's spectrum.
-/// Hue comes from each band's strongest frequency, lightness from how loud
-/// the band is relative to the others.
+/// Hue comes from each band's dominant note (via the circle of fifths),
+/// saturation from how tonal vs noisy the band is, and lightness from the
+/// overall loudness combined with how loud the band is relative to the others.
+///
+/// Returns an error instead of a palette when the recording is too short or
+/// too quiet to say anything meaningful (otherwise you'd get colors made
+/// from mic hiss).
 pub fn generate_palette(
     samples: &[f32],
     sample_rate: NonZero<u32>,
     opts: &RunOpts,
-) -> Vec<(u8, u8, u8)> {
-    if samples.len() < 2 {
-        return Vec::new();
+) -> Result<Vec<Rgb>, Box<dyn Error>> {
+    // Need at least 0.1s of audio for the low band to have any FFT bins
+    if samples.len() < (sample_rate.get() / 10) as usize {
+        return Err("recording is too short to analyze".into());
+    }
+
+    let level = level_from_rms(rms(samples));
+    if level < MIN_LEVEL {
+        return Err(format!(
+            "recording is too quiet (level {level:.2}, need at least {MIN_LEVEL:.2}). \
+             Turn the volume up, move closer to the mic, or check the input \
+             device with `-m check-inputs`"
+        )
+        .into());
     }
 
     let spectrum = magnitude_spectrum(samples);
@@ -177,12 +260,15 @@ pub fn generate_palette(
         .map(|b| analyze_band(&spectrum, samples.len(), sample_rate, b))
         .collect();
 
+    let level = level_from_rms(rms(samples));
+
     if opts.debug {
+        println!("level: {:.2} (rms {:.4})", level, rms(samples));
         for (band, s) in BANDS.iter().zip(&stats) {
             match s {
                 Some(s) => println!(
-                    "{:>4}: peak {:.0} Hz, avg power {:.4}",
-                    band.name, s.peak_freq, s.avg_power
+                    "{:>4}: peak {:.0} Hz, note {}, avg power {:.4}, flatness {:.3}",
+                    band.name, s.peak_freq, NOTE_NAMES[s.pitch_class], s.avg_power, s.flatness
                 ),
                 None => println!("{:>4}: no bins in range", band.name),
             }
@@ -195,18 +281,24 @@ pub fn generate_palette(
         .map(|s| s.avg_power)
         .fold(0.0_f32, f32::max);
 
-    stats
+    let palette = stats
         .into_iter()
         .flatten()
         .map(|s| {
             let ratio = if max_power > 0.0 { s.avg_power / max_power } else { 0.0 };
 
-            let hue = freq_to_hue(s.peak_freq);
+            let hue = pitch_class_to_hue(s.pitch_class);
             // powf(0.25) compresses the range so quiet bands stay visible
-            let lightness = 0.2 + 0.6 * ratio.powf(0.25);
-            let saturation = 0.75;
+            // Overall loudness sets how bright the palette can get; each band's
+            // share of the power scales it down from there. powf(0.25)
+            // compresses the range so quiet bands stay visible.
+            // Capped at 0.75 so the loudest band doesn't wash out to white.
+            let lightness = 0.15 + 0.6 * level * ratio.powf(0.25);
+            let saturation = saturation_from_flatness(s.flatness);
 
             hsl_to_rgb(hue, saturation, lightness)
         })
-        .collect()
+        .collect();
+
+    Ok(palette)
 }
