@@ -1,30 +1,145 @@
+use std::{error::Error, f32::consts::PI, num::NonZero, ops::Range};
+
 use rustfft::{FftPlanner, num_complex::Complex};
-use std::f32::consts::PI;
-use std::num::NonZero;
-use image::{Rgba, RgbaImage};
-use std::error::Error;
 
-use crate::RunOpts;
+pub type Rgb = (u8, u8, u8);
 
-type Rgb = (u8, u8, u8);
+// ---------------------------------------------------------------------------
+// Frequency bands
+// ---------------------------------------------------------------------------
 
-struct Band {
-    name: &'static str,
-    low_hz: f32,
-    high_hz: f32,
+/// Range of frequencies we turn into colors. Below 30 Hz is mostly rumble,
+/// above 8 kHz is mostly cymbal/hiss with little pitch information.
+const MIN_HZ: f32 = 30.0;
+const MAX_HZ: f32 = 8000.0;
+
+/// Splits MIN_HZ..MAX_HZ into `n` bands of equal width on a log scale, so
+/// each band covers the same number of octaves (the way we hear pitch).
+fn bands(n: usize) -> Vec<(f32, f32)> {
+    let ratio = (MAX_HZ / MIN_HZ).powf(1.0 / n as f32);
+    (0..n)
+        .map(|i| (MIN_HZ * ratio.powi(i as i32), MIN_HZ * ratio.powi(i as i32 + 1)))
+        .collect()
 }
 
-const BANDS: [Band; 3] = [
-    Band { name: "low",  low_hz: 20.0,   high_hz: 250.0 },
-    Band { name: "mid",  low_hz: 250.0,  high_hz: 2000.0 },
-    Band { name: "high", low_hz: 2000.0, high_hz: 8000.0 },
-];
+// ---------------------------------------------------------------------------
+// Spectrum analysis
+// ---------------------------------------------------------------------------
+
+/// FFT window length. At 44.1 kHz this is ~1.5s per window and 0.67 Hz per
+/// bin, fine enough to tell neighbouring notes apart even in the bass.
+const FFT_SIZE: usize = 65_536;
 
 struct BandStats {
-    peak_freq: f32,  // strongest frequency inside the band
-    pitch_class: usize, // dominant note in the band (0 = C ... 11 = B)
-    avg_power: f32,  // mean power per bin, so wide bands aren't favored
-    flatness: f32,   // 0 = pure tone, ~0.56 = white noise (see spectral_flatness)
+    peak_freq: f32,     // strongest frequency inside the band
+    chroma: [f32; 12],  // power per pitch class (0 = C ... 11 = B)
+    power: f32,         // total power in the band
+    flatness: f32,      // 0 = pure tone, ~0.56 = white noise (see spectral_flatness)
+}
+
+/// Converts a Hz range into FFT bin indices (skipping bin 0, the DC offset).
+fn bin_range(low_hz: f32, high_hz: f32, hz_per_bin: f32, bins: usize) -> Option<Range<usize>> {
+    let start = ((low_hz / hz_per_bin).ceil() as usize).max(1);
+    let end = ((high_hz / hz_per_bin).floor() as usize).min(bins);
+    (start < end).then_some(start..end)
+}
+
+/// Analyzes each band using Welch's method: the audio is cut into
+/// overlapping windows, each window gets its own FFT, and the power spectra
+/// are averaged. Compared to one giant FFT this is much faster on long files,
+/// and the result reflects the whole track instead of being dominated by
+/// whichever single moment happened to be loudest.
+fn analyze_bands(
+    samples: &[f32],
+    sample_rate: NonZero<u32>,
+    bands: &[(f32, f32)],
+) -> Vec<Option<BandStats>> {
+    let size = FFT_SIZE.min(samples.len());
+    let hop = (size / 2).max(1); // 50% overlap
+    let bins = size / 2; // bins above Nyquist mirror the ones below
+    let hz_per_bin = sample_rate.get() as f32 / size as f32;
+
+    let ranges: Vec<Option<Range<usize>>> = bands
+        .iter()
+        .map(|&(lo, hi)| bin_range(lo, hi, hz_per_bin, bins))
+        .collect();
+
+    // Hann window: reduces spectral leakage so loud low frequencies
+    // don't smear into the bands above them
+    let window: Vec<f32> = (0..size)
+        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (size as f32 - 1.0).max(1.0)).cos()))
+        .collect();
+
+    let fft = FftPlanner::new().plan_fft_forward(size);
+    let mut buffer = vec![Complex::new(0.0, 0.0); size];
+    let mut avg_power = vec![0.0_f32; bins];
+    // Flatness is measured per window (that's what the 0.56 noise reference
+    // assumes) and averaged, weighted by power so silent gaps don't count.
+    let mut flatness_sum = vec![0.0_f32; bands.len()];
+    let mut flatness_weight = vec![0.0_f32; bands.len()];
+    let mut windows = 0;
+
+    for start in (0..=samples.len() - size).step_by(hop) {
+        for ((b, &s), &w) in buffer.iter_mut().zip(&samples[start..start + size]).zip(&window) {
+            *b = Complex::new(s * w, 0.0);
+        }
+        fft.process(&mut buffer);
+
+        let power: Vec<f32> = buffer[..bins].iter().map(|c| c.norm_sqr()).collect();
+        for (avg, p) in avg_power.iter_mut().zip(&power) {
+            *avg += p;
+        }
+        for (i, range) in ranges.iter().enumerate() {
+            if let Some(range) = range {
+                let slice = &power[range.clone()];
+                let weight = slice.iter().sum::<f32>();
+                flatness_sum[i] += spectral_flatness(slice) * weight;
+                flatness_weight[i] += weight;
+            }
+        }
+        windows += 1;
+    }
+    for p in &mut avg_power {
+        *p /= windows as f32;
+    }
+
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(i, range)| {
+            let range = range.clone()?;
+            let slice = &avg_power[range.clone()];
+
+            let (peak_offset, _) = slice
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
+
+            // Chroma: fold every bin's power into one of 12 pitch classes.
+            // More robust than the single peak bin, since a note's energy
+            // is spread over neighbouring bins and its octaves.
+            let mut chroma = [0.0_f32; 12];
+            for (offset, p) in slice.iter().enumerate() {
+                let freq = (range.start + offset) as f32 * hz_per_bin;
+                chroma[freq_to_pitch_class(freq)] += p;
+            }
+
+            let flatness = if flatness_weight[i] > 0.0 {
+                flatness_sum[i] / flatness_weight[i]
+            } else {
+                1.0
+            };
+
+            Some(BandStats {
+                peak_freq: (range.start + peak_offset) as f32 * hz_per_bin,
+                chroma,
+                // Total (not per-bin) power: log-spaced bands each span the
+                // same number of octaves, so totals compare fairly
+                power: slice.iter().sum(),
+                flatness,
+            })
+        })
+        .collect()
 }
 
 /// Spectral flatness of a band: geometric mean / arithmetic mean of power.
@@ -42,99 +157,9 @@ fn spectral_flatness(power: &[f32]) -> f32 {
     geo / arith
 }
 
-const NOISE_FLATNESS: f32 = 0.56;
-/// Below this loudness level (0.1 = -55 dBFS) we refuse to make a palette.
-/// Typical mic self-noise in a quiet room sits around -60 to -70 dBFS.
-const MIN_LEVEL: f32 = 0.1;
-
-/// Maps flatness to saturation: tonal bands are vivid, noisy bands go grey.
-fn saturation_from_flatness(flatness: f32) -> f32 {
-    let tonality = 1.0 - (flatness / NOISE_FLATNESS).clamp(0.0, 1.0);
-    0.15 + 0.8 * tonality
-}
-
-fn rms(samples: &[f32]) -> f32 {
-    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
-}
-
-/// Maps RMS to a 0-1 loudness level on a dB scale.
-/// -60 dBFS (near silence) -> 0.0, -10 dBFS (very loud) -> 1.0.
-fn level_from_rms(rms: f32) -> f32 {
-    const FLOOR_DB: f32 = -60.0;
-    const CEIL_DB: f32 = -10.0;
-    let db = 20.0 * rms.max(1e-9).log10();
-    ((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB)).clamp(0.0, 1.0)
-}
-
-fn lerp(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t).round() as u8
-}
-
-/// 0.0 outside the rounded corners, 1.0 inside, with a 1px antialiased edge.
-fn corner_alpha(x: u32, y: u32, w: u32, h: u32, r: f32) -> f32 {
-    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-    let cx = if px < r { r } else if px > w as f32 - r { w as f32 - r } else { return 1.0 };
-    let cy = if py < r { r } else if py > h as f32 - r { h as f32 - r } else { return 1.0 };
-    let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
-    (r - dist + 0.5).clamp(0.0, 1.0)
-}
-
-pub fn save_palette_card(palette: &[(u8, u8, u8)], path: &str) -> Result<(), Box<dyn Error>> {
-    const W: u32 = 1200;
-    const H: u32 = 630;
-    const SWATCH_H: u32 = 140; // height of the solid swatch strip at the bottom
-    const RADIUS: f32 = 32.0;
-
-    let n = palette.len();
-    if n == 0 {
-        return Err("palette is empty".into());
-    }
-
-    let img = RgbaImage::from_fn(W, H, |x, y| {
-        let (r, g, b) = if y >= H - SWATCH_H {
-            // Bottom strip: one solid block per color
-            palette[(x as usize * n / W as usize).min(n - 1)]
-        } else if n == 1 {
-            palette[0]
-        } else {
-            // Gradient: find which two colors this x sits between
-            let t = x as f32 / (W - 1) as f32 * (n - 1) as f32;
-            let i = (t.floor() as usize).min(n - 2);
-            let f = t - i as f32;
-            let f = f * f * (3.0 - 2.0 * f); // smoothstep for softer transitions
-            let (c0, c1) = (palette[i], palette[i + 1]);
-            (lerp(c0.0, c1.0, f), lerp(c0.1, c1.1, f), lerp(c0.2, c1.2, f))
-        };
-
-        let alpha = (corner_alpha(x, y, W, H, RADIUS) * 255.0) as u8;
-        Rgba([r, g, b, alpha])
-    });
-
-    img.save(path)?;
-    Ok(())
-}
-
-/// Converts HSL (h: 0-360, s: 0-1, l: 0-1) to RGB (0-255 each)
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = l - c / 2.0;
-
-    let (r1, g1, b1) = match h as u32 {
-        0..=59 => (c, x, 0.0),
-        60..=119 => (x, c, 0.0),
-        120..=179 => (0.0, c, x),
-        180..=239 => (0.0, x, c),
-        240..=299 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-
-    (
-        ((r1 + m) * 255.0).round() as u8,
-        ((g1 + m) * 255.0).round() as u8,
-        ((b1 + m) * 255.0).round() as u8,
-    )
-}
+// ---------------------------------------------------------------------------
+// Sound -> color mapping
+// ---------------------------------------------------------------------------
 
 const NOTE_NAMES: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
@@ -156,139 +181,145 @@ fn pitch_class_to_hue(pc: usize) -> f32 {
     fifths_pos as f32 * 30.0
 }
 
-/// One FFT over the whole recording. Returns the magnitude of each bin
-/// up to Nyquist (the second half of the FFT output just mirrors the first).
-fn magnitude_spectrum(samples: &[f32]) -> Vec<f32> {
-    let n = samples.len();
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(n);
+/// A band only switches to a less dominant note if that note has at least
+/// this fraction of the band's strongest note's power. Stops us inventing
+/// colors from notes that are barely there (e.g. a single sine wave).
+const DISTINCT_NOTE_MIN: f32 = 0.25;
 
-    let mut buffer: Vec<Complex<f32>> = samples
+/// Picks the strongest note in each band, preferring notes that earlier
+/// bands haven't used yet. Without this, a song in one key tends to give
+/// every band the same root note, and so the same hue.
+fn pick_notes(chromas: &[[f32; 12]]) -> Vec<usize> {
+    let mut used = [false; 12];
+    chromas
         .iter()
-        .enumerate()
-        .map(|(i, &s)| {
-            // Hann window: reduces spectral leakage so loud low frequencies
-            // don't smear into the mid/high bands
-            let w = 0.5 * (1.0 - (2.0 * PI * i as f32 / (n as f32 - 1.0)).cos());
-            Complex { re: s * w, im: 0.0 }
+        .map(|chroma| {
+            let mut ranked: Vec<usize> = (0..12).collect();
+            ranked.sort_by(|&a, &b| chroma[b].total_cmp(&chroma[a]));
+            let top = ranked[0];
+            let pick = ranked
+                .iter()
+                .copied()
+                .take_while(|&pc| chroma[pc] >= chroma[top] * DISTINCT_NOTE_MIN)
+                .find(|&pc| !used[pc])
+                .unwrap_or(top);
+            used[pick] = true;
+            pick
         })
-        .collect();
-
-    fft.process(&mut buffer);
-
-    buffer.iter().take(n / 2).map(|c| c.norm()).collect()
+        .collect()
 }
 
-fn analyze_band(
-    spectrum: &[f32],
-    n: usize,
-    sample_rate: NonZero<u32>,
-    band: &Band,
-) -> Option<BandStats> {
-    let hz_per_bin = sample_rate.get() as f32 / n as f32;
+const NOISE_FLATNESS: f32 = 0.56;
 
-    // Convert the band's Hz range into bin indices (skip bin 0, the DC offset)
-    let start = ((band.low_hz / hz_per_bin).ceil() as usize).max(1);
-    let end = ((band.high_hz / hz_per_bin).floor() as usize).min(spectrum.len());
-    if start >= end {
-        return None;
-    }
-
-    let slice = &spectrum[start..end];
-
-    let (peak_offset, _) = slice
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
-
-    let power: Vec<f32> = slice.iter().map(|m| m * m).collect();
-    let avg_power = power.iter().sum::<f32>() / power.len() as f32;
-    let flatness = spectral_flatness(&power);
-
-    // Chroma: fold every bin's power into one of 12 pitch classes, then pick
-    // the strongest. More robust than the single peak bin, since a note's
-    // energy is spread over neighbouring bins and its octaves.
-    let mut chroma = [0.0_f32; 12];
-    for (i, m) in slice.iter().enumerate() {
-        let freq = (start + i) as f32 * hz_per_bin;
-        chroma[freq_to_pitch_class(freq)] += m * m;
-    }
-    let (pitch_class, _) = chroma
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
-
-    Some(BandStats {
-        peak_freq: (start + peak_offset) as f32 * hz_per_bin,
-        pitch_class,
-        avg_power,
-        flatness,
-    })
+/// Maps flatness to saturation: tonal bands are vivid, noisy bands go grey.
+fn saturation_from_flatness(flatness: f32) -> f32 {
+    let tonality = 1.0 - (flatness / NOISE_FLATNESS).clamp(0.0, 1.0);
+    0.15 + 0.8 * tonality
 }
 
+/// Below this loudness level (0.1 = -55 dBFS) we refuse to make a palette.
+/// Typical mic self-noise in a quiet room sits around -60 to -70 dBFS.
+const MIN_LEVEL: f32 = 0.1;
+
+fn rms(samples: &[f32]) -> f32 {
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Maps RMS to a 0-1 loudness level on a dB scale.
+/// -60 dBFS (near silence) -> 0.0, -10 dBFS (very loud) -> 1.0.
+fn level_from_rms(rms: f32) -> f32 {
+    const FLOOR_DB: f32 = -60.0;
+    const CEIL_DB: f32 = -10.0;
+    let db = 20.0 * rms.max(1e-9).log10();
+    ((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB)).clamp(0.0, 1.0)
+}
+
+/// Converts HSL (h: 0-360, s: 0-1, l: 0-1) to RGB (0-255 each)
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Rgb {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+
+    let (r1, g1, b1) = match h as u32 {
+        0..=59 => (c, x, 0.0),
+        60..=119 => (x, c, 0.0),
+        120..=179 => (0.0, c, x),
+        180..=239 => (0.0, x, c),
+        240..=299 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+
+    (
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
+}
+
+/// Generates a palette of up to `n_colors` colors, one per frequency band,
+/// ordered from bass to treble.
+///
 /// Hue comes from each band's dominant note (via the circle of fifths),
 /// saturation from how tonal vs noisy the band is, and lightness from the
 /// overall loudness combined with how loud the band is relative to the others.
 ///
-/// Returns an error instead of a palette when the recording is too short or
+/// Returns an error instead of a palette when the audio is too short or
 /// too quiet to say anything meaningful (otherwise you'd get colors made
 /// from mic hiss).
 pub fn generate_palette(
     samples: &[f32],
     sample_rate: NonZero<u32>,
-    opts: &RunOpts,
+    n_colors: usize,
+    debug: bool,
 ) -> Result<Vec<Rgb>, Box<dyn Error>> {
-    // Need at least 0.1s of audio for the low band to have any FFT bins
+    // Need at least 0.1s of audio for the bass bands to have any FFT bins
     if samples.len() < (sample_rate.get() / 10) as usize {
-        return Err("recording is too short to analyze".into());
+        return Err("audio is too short to analyze".into());
     }
 
     let level = level_from_rms(rms(samples));
     if level < MIN_LEVEL {
         return Err(format!(
-            "recording is too quiet (level {level:.2}, need at least {MIN_LEVEL:.2}). \
-             Turn the volume up, move closer to the mic, or check the input \
-             device with `-m check-inputs`"
+            "audio is too quiet (level {level:.2}, need at least {MIN_LEVEL:.2}). \
+             Turn the volume up, move closer to the mic, or pick another \
+             input with --device"
         )
         .into());
     }
 
-    let spectrum = magnitude_spectrum(samples);
-
-    let stats: Vec<Option<BandStats>> = BANDS
+    let bands = bands(n_colors);
+    // Bands too narrow for the FFT resolution (very short audio) are dropped
+    let (bands, stats): (Vec<&(f32, f32)>, Vec<BandStats>) = bands
         .iter()
-        .map(|b| analyze_band(&spectrum, samples.len(), sample_rate, b))
-        .collect();
+        .zip(analyze_bands(samples, sample_rate, &bands))
+        .filter_map(|(band, s)| Some((band, s?)))
+        .unzip();
 
-    let level = level_from_rms(rms(samples));
+    let notes = pick_notes(&stats.iter().map(|s| s.chroma).collect::<Vec<_>>());
+    let max_power = stats.iter().map(|s| s.power).fold(0.0_f32, f32::max);
 
-    if opts.debug {
-        println!("level: {:.2} (rms {:.4})", level, rms(samples));
-        for (band, s) in BANDS.iter().zip(&stats) {
-            match s {
-                Some(s) => println!(
-                    "{:>4}: peak {:.0} Hz, note {}, avg power {:.4}, flatness {:.3}",
-                    band.name, s.peak_freq, NOTE_NAMES[s.pitch_class], s.avg_power, s.flatness
-                ),
-                None => println!("{:>4}: no bins in range", band.name),
-            }
+    if debug {
+        eprintln!(
+            "level: {level:.2} (rms {:.4}), {:.1}s at {} Hz",
+            rms(samples),
+            samples.len() as f32 / sample_rate.get() as f32,
+            sample_rate
+        );
+        for ((band, s), &note) in bands.iter().zip(&stats).zip(&notes) {
+            eprintln!(
+                "{:>5.0}-{:<5.0} Hz: peak {:>5.0} Hz, note {:<2}, power {:.2e}, flatness {:.3}",
+                band.0, band.1, s.peak_freq, NOTE_NAMES[note], s.power, s.flatness
+            );
         }
     }
 
-    let max_power = stats
-        .iter()
-        .flatten()
-        .map(|s| s.avg_power)
-        .fold(0.0_f32, f32::max);
-
     let palette = stats
-        .into_iter()
-        .flatten()
-        .map(|s| {
-            let ratio = if max_power > 0.0 { s.avg_power / max_power } else { 0.0 };
+        .iter()
+        .zip(&notes)
+        .map(|(s, &note)| {
+            let ratio = if max_power > 0.0 { s.power / max_power } else { 0.0 };
 
-            let hue = pitch_class_to_hue(s.pitch_class);
-            // powf(0.25) compresses the range so quiet bands stay visible
+            let hue = pitch_class_to_hue(note);
             // Overall loudness sets how bright the palette can get; each band's
             // share of the power scales it down from there. powf(0.25)
             // compresses the range so quiet bands stay visible.
@@ -301,4 +332,198 @@ pub fn generate_palette(
         .collect();
 
     Ok(palette)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: u32 = 48_000;
+
+    fn sr() -> NonZero<u32> {
+        NonZero::new(SR).unwrap()
+    }
+
+    fn sine(freq: f32, secs: f32) -> Vec<f32> {
+        let n = (SR as f32 * secs) as usize;
+        (0..n)
+            .map(|i| (2.0 * PI * freq * i as f32 / SR as f32).sin())
+            .collect()
+    }
+
+    /// Deterministic white noise in [-1, 1] (xorshift, no rand crate needed)
+    fn noise(secs: f32) -> Vec<f32> {
+        let mut x: u32 = 0x1234_5678;
+        (0..(SR as f32 * secs) as usize)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as f32 / u32::MAX as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn scaled(samples: Vec<f32>, amp: f32) -> Vec<f32> {
+        samples.into_iter().map(|s| s * amp).collect()
+    }
+
+    /// Stats for a single 250-2000 Hz band
+    fn mid_band(samples: &[f32]) -> BandStats {
+        analyze_bands(samples, sr(), &[(250.0, 2000.0)])
+            .pop()
+            .flatten()
+            .expect("band should have bins")
+    }
+
+    fn top_note(chroma: &[f32; 12]) -> usize {
+        (0..12).max_by(|&a, &b| chroma[a].total_cmp(&chroma[b])).unwrap()
+    }
+
+    // --- bands & spectrum ---
+
+    #[test]
+    fn bands_cover_the_range_contiguously() {
+        let b = bands(5);
+        assert_eq!(b.len(), 5);
+        assert!((b[0].0 - MIN_HZ).abs() < 1e-3);
+        assert!((b[4].1 - MAX_HZ).abs() < 1e-1);
+        for pair in b.windows(2) {
+            assert!((pair[0].1 - pair[1].0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn sine_440hz_peaks_at_440_and_is_note_a() {
+        let s = mid_band(&sine(440.0, 1.0));
+        assert!((s.peak_freq - 440.0).abs() < 2.0, "peak was {} Hz", s.peak_freq);
+        assert_eq!(NOTE_NAMES[top_note(&s.chroma)], "A");
+    }
+
+    #[test]
+    fn long_audio_uses_multiple_windows() {
+        // 10s at 48kHz = 480k samples, several 64k windows. Still finds A.
+        let s = mid_band(&sine(440.0, 10.0));
+        assert!((s.peak_freq - 440.0).abs() < 1.0, "peak was {} Hz", s.peak_freq);
+    }
+
+    #[test]
+    fn stereo_without_downmix_halves_frequencies() {
+        // Documents the v0.1 bug: interleaved stereo treated as mono
+        let interleaved: Vec<f32> = sine(440.0, 1.0).into_iter().flat_map(|s| [s, s]).collect();
+        let s = analyze_bands(&interleaved, sr(), &[(20.0, 250.0)]).pop().flatten().unwrap();
+        assert!((s.peak_freq - 220.0).abs() < 2.0, "peak was {} Hz", s.peak_freq);
+    }
+
+    #[test]
+    fn sine_is_tonal_noise_is_flat() {
+        let tone = mid_band(&sine(440.0, 3.0)).flatness;
+        let hiss = mid_band(&noise(3.0)).flatness;
+        assert!(tone < 0.05, "sine flatness was {tone}");
+        assert!(hiss > 0.4, "noise flatness was {hiss}");
+        assert!(saturation_from_flatness(tone) > 0.85);
+        assert!(saturation_from_flatness(hiss) < 0.4);
+    }
+
+    // --- notes & hues ---
+
+    #[test]
+    fn pitch_classes() {
+        assert_eq!(freq_to_pitch_class(440.0), 9);   // A4
+        assert_eq!(freq_to_pitch_class(110.0), 9);   // A2, octave ignored
+        assert_eq!(freq_to_pitch_class(261.63), 0);  // C4
+        assert_eq!(freq_to_pitch_class(392.0), 7);   // G4
+        assert_eq!(freq_to_pitch_class(27.5), 9);    // A0, low edge of piano
+    }
+
+    #[test]
+    fn circle_of_fifths_hues() {
+        assert_eq!(pitch_class_to_hue(0), 0.0);   // C
+        assert_eq!(pitch_class_to_hue(7), 30.0);  // G, one fifth up
+        assert_eq!(pitch_class_to_hue(2), 60.0);  // D, two fifths up
+        assert_eq!(pitch_class_to_hue(5), 330.0); // F, one fifth down
+    }
+
+    #[test]
+    fn bands_prefer_distinct_notes() {
+        // A (9) strongest, E (4) also clearly present
+        let mut chroma = [0.0; 12];
+        chroma[9] = 1.0;
+        chroma[4] = 0.6;
+        assert_eq!(pick_notes(&[chroma, chroma]), vec![9, 4]);
+    }
+
+    #[test]
+    fn faint_notes_are_not_promoted() {
+        // E is too weak to count, so the second band repeats A
+        let mut chroma = [0.0; 12];
+        chroma[9] = 1.0;
+        chroma[4] = 0.1;
+        assert_eq!(pick_notes(&[chroma, chroma]), vec![9, 9]);
+    }
+
+    // --- loudness ---
+
+    #[test]
+    fn loudness_levels() {
+        assert_eq!(level_from_rms(0.0), 0.0);    // silence
+        assert_eq!(level_from_rms(0.001), 0.0);  // -60 dBFS
+        assert_eq!(level_from_rms(1.0), 1.0);    // full scale
+        let mid = level_from_rms(0.01);          // -40 dBFS
+        assert!((mid - 0.4).abs() < 1e-4, "got {mid}");
+    }
+
+    // --- whole palette ---
+
+    #[test]
+    fn palette_has_requested_size() {
+        let audio = scaled(noise(3.0), 0.3);
+        for n in [1, 3, 5, 8, 12] {
+            assert_eq!(generate_palette(&audio, sr(), n, false).unwrap().len(), n);
+        }
+    }
+
+    #[test]
+    fn same_input_gives_same_palette() {
+        let audio = scaled(sine(440.0, 2.0), 0.3);
+        let a = generate_palette(&audio, sr(), 5, false).unwrap();
+        let b = generate_palette(&audio, sr(), 5, false).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn louder_audio_gives_lighter_palette() {
+        let brightness = |amp: f32| -> u32 {
+            generate_palette(&scaled(sine(440.0, 1.0), amp), sr(), 5, false)
+                .unwrap()
+                .iter()
+                .map(|&(r, g, b)| r as u32 + g as u32 + b as u32)
+                .sum()
+        };
+        assert!(brightness(0.5) > brightness(0.01));
+    }
+
+    #[test]
+    fn silence_is_rejected() {
+        let err = generate_palette(&vec![0.0; SR as usize], sr(), 5, false).unwrap_err();
+        assert!(err.to_string().contains("too quiet"), "got: {err}");
+    }
+
+    #[test]
+    fn faint_hiss_is_rejected() {
+        // Noise at roughly -70 dBFS, like a mic in a silent room
+        assert!(generate_palette(&scaled(noise(1.0), 0.0005), sr(), 5, false).is_err());
+    }
+
+    #[test]
+    fn quiet_but_real_sound_is_accepted() {
+        // -43 dBFS sine: quiet, but well above the noise floor
+        assert!(generate_palette(&scaled(sine(440.0, 1.0), 0.01), sr(), 5, false).is_ok());
+    }
+
+    #[test]
+    fn too_short_is_rejected() {
+        let err = generate_palette(&sine(440.0, 0.01), sr(), 5, false).unwrap_err();
+        assert!(err.to_string().contains("too short"), "got: {err}");
+    }
 }
